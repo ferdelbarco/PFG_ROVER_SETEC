@@ -7,10 +7,10 @@ Este proyecto aborda el diseño de un sistema de control de velocidad para un Ro
 
 ## Objetivos
 
-# General
+### General
 1.  Diseñar un sistema de control de velocidad para un Rover destinado a aplicaciones lunares, considerando los requisitos operativos específicos del entorno y su implementación práctica.
 
-# Específicos
+### Específicos
 1.  Establecer los valores de especificaciones y parámetros que caracterizan el problema a solucionar y la operatividad de la solución.
 2.	Diseñar un conjunto de algoritmos de control que cumplan con los requerimientos operativos definidos para el Rover en ambiente lunar.
 3.	Evaluar el desempeño de los algoritmos de control propuestos mediante pruebas en condiciones de laboratorio que simulen escenarios reales.
