@@ -1,0 +1,307 @@
+#include <SoftPWM.h>
+#include <SoftwareSerial.h>
+
+// Pines de los motores
+const int motorL1 = 2;
+const int motorL2 = 3;
+const int motorR1 = 4;
+const int motorR2 = 5;
+
+// Sensor Hall
+const int hallSensorPin = 8;
+
+// Comunicación con OpenLog
+SoftwareSerial logSerial(255, 10); // Solo TX al OpenLog
+
+// Constantes PID og matlab
+const float Kp = 5.17287241293034;
+const float Ki = 19.7060495215779;
+const float Kd = -0.491374642011671;
+
+const float N = 6.05192952708866;
+float filtered_derivative = 0.0;
+
+// Variables PID
+float error = 0, prev_error = 0;
+float integral = 0, derivative = 0;
+float control_output = 0;
+
+// Velocidad de referencia en cm/s
+float refSpeed = 0.0;
+
+// Radio de la rueda en cm
+const float wheel_radius_cm = 3.75;  
+
+// Limites PWM para saturacion
+const int pwm_min = 30;
+const int pwm_max = 60;
+
+// Tiempo de muestreo del PID
+unsigned long lastControlTime = 0;
+const unsigned long control_interval = 50;  // ms
+const float dt = control_interval / 1000.0;
+
+// Maquina de estados
+enum State { INIT_WAIT, ACTIVE, REST }; // Estados
+State state = INIT_WAIT; // Estado inicial en espera
+unsigned long phaseStartTime = 0;
+
+// Secuencia de PWM
+int pwmValue = 0;
+
+// Definir tiempo de muestreo constante
+const unsigned long tiempo_muestreo = 50;
+
+// Variables para el calculo de la velocidad angular
+bool lastHallState = LOW;
+unsigned long lastPulseTime = 0;
+unsigned long pulse_deltaT = 0;
+const int pulses_per_rev = 4;
+float w_rpm = 0.0;
+float w_rads = 0.0;
+float speed_cms = 0.0;
+uint8_t pwm_usado = 0;
+
+unsigned long lastLogTime = 0; // debe estar en ms porque solo puede ser entero
+unsigned long startTime = 0;
+
+// movmean filter
+const int N_movmean = 10;
+float movmean_hist[N_movmean] = {0.0};
+int movmean_index = 0;
+bool movmean_buffer_full = false;
+float new_speed_cms = 0.0;  // velocidad antes del filtrado
+
+/////////////////////////////// FUNCIONES ///////////////////////////////
+
+bool DetectarFlancoSubida(uint8_t pinSensor,
+                          unsigned long currentTime,
+                          bool& lastState,
+                          unsigned long& timeLastPulse,
+                          unsigned long& deltaT) {
+  bool currentState = digitalRead(pinSensor);
+
+  if (lastState == LOW && currentState == HIGH) {
+    deltaT = currentTime - timeLastPulse;
+    timeLastPulse = currentTime;
+    lastState = currentState;
+    return true;  // Se detectó flanco de subida
+  }
+
+  lastState = currentState;
+  return false;   // No hubo flanco
+}
+
+// Definir tiempo de muestreo constante y guardar datos en OpenLog
+void MuestreoDataLog(unsigned long now, 
+                     unsigned long& lastLogTime, 
+                     const unsigned long tiempo_muestreo,
+                     unsigned long pulse_deltaT, 
+                     uint8_t pwm, 
+                     float rpm, 
+                     float rads,
+                     float cms,
+                     float new_cms,
+                     float ref,
+                     float err,
+                     float control,
+                     float kp,
+                     float ki,
+                     float kd,
+                     float n) {
+  // Guardar datos a un tiempo de muestreo constante
+  if (now - lastLogTime >= tiempo_muestreo) {
+      lastLogTime = now;
+      float timestamp = (now - startTime) / 1000.0; // marca de tiempo en segundos
+
+      String dataLine = String(timestamp, 2) + "," +
+                        String(pulse_deltaT) + "," +
+                        String(pwm) + "," +
+                        String(rpm, 4) + "," +
+                        String(rads, 4) + "," +
+                        String(speed_cms, 4) + "," +
+                        String(new_cms, 4) + "," +
+                        String(ref, 4) + "," +
+                        String(err, 4) + "," +
+                        String(control, 4) + "," +
+                        String(kp, 4) + "," +
+                        String(ki, 4) + "," +
+                        String(kd, 4) + "," +
+                        String(n, 4);
+
+      logSerial.println(dataLine); // Guarda los datos en el OpenLog
+  }
+}
+
+// Funcion para activar los motores
+void SetMotors(uint8_t pwmValue) {
+  // Movimiento solo hacia delante
+  SoftPWMSet(motorL1, pwmValue);
+  SoftPWMSet(motorL2, 0);
+  SoftPWMSet(motorR1, 0);
+  // Corrección proporcional del 10 % para el motor derecho solo si pwmValue > 0
+  uint8_t pwmRight = 0;
+  if (pwmValue > 0) {
+    int correccion = round(pwmValue * 0.10);  // calcula factor de corrección
+    pwmRight = constrain((int)pwmValue + correccion, 0, 255); // aplica factor de corrección
+  }
+  SoftPWMSet(motorR2, pwmRight);
+}
+
+void GetAngVel(unsigned long pulse_deltaT_l, const int pulses_per_rev, float& w_rads, float& w_rpm, float& speed_cms) {
+  if (pulse_deltaT_l > 0) {
+    // Cálculo de velocidad angular (rad/s)
+    float new_w_rads = (2.0 * PI * 1000 / (pulse_deltaT_l * pulses_per_rev));
+    // Cálculo de velocidad lineal (cm/s)
+    new_speed_cms = new_w_rads * wheel_radius_cm;
+    // Cálculo de velocidad RPM
+    w_rpm = float(60000) / (pulse_deltaT_l * pulses_per_rev);
+
+    // Actualizar historial de media móvil
+    movmean_hist[movmean_index] = new_w_rads;
+    movmean_index = (movmean_index + 1) % N_movmean;
+    if (movmean_index == 0) movmean_buffer_full = true;
+
+    // Calcular la media móvil
+    float sum = 0.0;
+    int count = movmean_buffer_full ? N_movmean : movmean_index;
+    for (int i = 0; i < count; i++) {
+      sum += movmean_hist[i];
+    }
+    w_rads = sum / count;
+
+    // Calcular velocidad lineal (cm/s) filtrada
+    speed_cms = w_rads * wheel_radius_cm;
+  }
+}
+
+void SpeedControl(unsigned long now) {
+  if (now - lastControlTime >= control_interval) {
+    lastControlTime = now;
+
+    // Calcular error
+    error = refSpeed - speed_cms;
+
+    // Derivada filtrada
+    float derivative_raw = (error - prev_error) / dt;
+    filtered_derivative = (N * Kd * derivative_raw + filtered_derivative * (1 - N * dt)) / (1 + N * dt);
+
+    // PID parcial (sin el término integral aún)
+    float pid_partial = Kp * error + Kd * filtered_derivative;
+
+    // Tentativa de salida con término integral actual
+    float tentative_output = pid_partial + Ki * integral;
+
+    // Comprobar saturación y contribución del error
+    bool is_saturated = (tentative_output > pwm_max || tentative_output < pwm_min);
+    bool error_drives_saturation = 
+      (tentative_output > pwm_max && error > 0) || 
+      (tentative_output < pwm_min && error < 0);
+
+    // Acumular la integral solo si no hay windup
+    if (!(is_saturated && error_drives_saturation)) {
+      integral += error * dt;
+    }
+
+    // Salida final del controlador
+    control_output = pid_partial + Ki * integral;
+
+    // Convertir a PWM y saturar
+    pwmValue = constrain(int(control_output), pwm_min, pwm_max);
+
+    // Aplicar control
+    SetMotors(pwmValue);
+    prev_error = error;
+    pwm_usado = pwmValue;
+  }
+}
+
+void CheckZeroVelocity(uint8_t pwmValue, unsigned long now, unsigned long lastPulseTime, float& w_rpm, float& w_rads, float& speed_cms) {
+  if (pwmValue == 0 && (now - lastPulseTime > 100)) { // Si la señal PWM es cero y han pasado más de 100s se actualiza la salida a cero
+    w_rpm = 0.0;
+    w_rads = 0.0;
+    speed_cms = 0.0;
+    new_speed_cms = 0.0;
+  }
+}
+
+
+/////////////////////////////// SETUP ///////////////////////////////
+
+void setup() {
+  // Inicializar SoftPWM
+  SoftPWMBegin();
+  SetMotors(0);
+  // Inicializar Pin Sensor Hall
+  pinMode(hallSensorPin, INPUT);
+
+  // Inicializar OpenLog
+  logSerial.begin(115200);
+  // Esperar OpenLog
+  delay(1000);
+  // Encabezado OpenLog
+  logSerial.println("timestamp_s,tiempo_entre_pulsos_ms,PWM,RPM,RADS,SPEED_CMS,NEW_SPEED_CMS,REF_SPEED,ERROR,CONTROL_OUTPUT,KP,KI,KD,N");
+
+  phaseStartTime = millis();
+}
+
+/////////////////////////////// LOOP ///////////////////////////////
+
+void loop() {
+  unsigned long now = millis();
+
+    // Cambiar de estado según el tiempo
+  switch (state) {
+    case INIT_WAIT:
+      if (now - phaseStartTime >= 3000) {  // Espera de 3 segundos
+        startTime = millis();
+        phaseStartTime = now;
+        state = ACTIVE;
+      }
+      break;
+
+    case ACTIVE:
+      // Actualizar refSpeed con entrada tipo escalón
+      float t_rel = (now - startTime) / 1000.0;  // tiempo relativo en segundos
+      if (t_rel >= 0.2) {
+        refSpeed = 20.0;  // paso a 15 cm/s a los 0.2 s
+      } else {
+        refSpeed = 0.0;
+      }
+
+      // Ejecutar control con PID
+      SpeedControl(now);
+
+      // Duración de la prueba activa 
+      if (now - phaseStartTime >= 15000) {
+        refSpeed = 0.0;
+        SetMotors(0);  // Detener motores
+        pwmValue = 0;
+        pwm_usado = 0;
+        phaseStartTime = now;
+        state = REST;
+      }
+      break;
+
+    case REST:
+      // Fase de reposo antes de terminar
+      if (now - phaseStartTime >= 3000) {
+        while (1);  // Fin del programa
+      }
+      break;
+  }
+  // Detecta flancos de subida en el sensor Hall
+  bool flanco_detectado = DetectarFlancoSubida(hallSensorPin, now, lastHallState, lastPulseTime, pulse_deltaT);
+
+  // Si detecta un flanco calcula la velocidad
+  if (flanco_detectado) {
+    GetAngVel(pulse_deltaT, pulses_per_rev, w_rads, w_rpm, speed_cms);
+    pwm_usado = pwmValue;  // Guarda el PWM en el momento del cálculo para evitar desalineamientos
+  }
+
+  // Seguridad para velocidad cero si no hay pulsos
+  CheckZeroVelocity(pwmValue, now, lastPulseTime, w_rpm, w_rads, speed_cms);
+
+  // Registro de datos
+  MuestreoDataLog(now, lastLogTime, tiempo_muestreo, pulse_deltaT, pwm_usado, w_rpm, w_rads, speed_cms, new_speed_cms, refSpeed, error, control_output, Kp, Ki, Kd, N);
+}
