@@ -1,4 +1,4 @@
-### PROYECTO FINAL DE GRADUACIÓN
+# PROYECTO FINAL DE GRADUACIÓN
 ## María Fernanda del Barco León
 
 ## Resumen
